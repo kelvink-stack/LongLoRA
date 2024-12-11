@@ -31,6 +31,7 @@ from llama_attn_replace_sft import replace_llama_attn
 from gptneox_attn_replace import replace_gpt_neox_attn
 from peft import LoraConfig, get_peft_model
 from torch.distributed import barrier
+from save_callback import SavePeftModelCallback
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -103,6 +104,10 @@ class TrainingArguments(transformers.TrainingArguments):
     use_full_attn: bool = field(
         default=False,
         metadata={"help": "Whether to use plain, full-attention for training."},
+    )
+    use_dilated: bool = field(
+        default=False,
+        metadata={"help": "Whether to use dilated attention mechanism."},
     )
     low_rank_training: bool = field(
         default=True,
@@ -240,7 +245,7 @@ def train():
     if model_args.model_type == "gpt-neox":
         replace_gpt_neox_attn(training_args.use_flash_attn, training_args.use_full_attn)
     else:
-        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn)
+        replace_llama_attn(training_args.use_flash_attn, training_args.use_full_attn, training_args.use_dilated)
 
     # Set RoPE scaling factor
     config = transformers.AutoConfig.from_pretrained(
@@ -266,12 +271,15 @@ def train():
         cache_dir=training_args.cache_dir,
         torch_dtype=torch.bfloat16,
         quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
+            load_in_8bit=True,
             llm_int8_threshold=6.0,
             llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
+            # load_in_4bit=True,
+            # llm_int8_threshold=6.0,
+            # llm_int8_has_fp16_weight=False,
+            # bnb_4bit_compute_dtype=torch.bfloat16,
+            # bnb_4bit_use_double_quant=True,
+            # bnb_4bit_quant_type="nf4",
         ),
     )
 
@@ -345,11 +353,12 @@ def train():
     for k, v in dtypes.items():
         print(k, v, v / total)
 
-    model.config.use_cache = False         # required for gradient checkpointing
-    model.enable_input_require_grads()     # required for gradient checkpointing
-    model.gradient_checkpointing_enable()  # enable gradient checkpointing
+    # model.config.use_cache = False         # required for gradient checkpointing
+    # model.enable_input_require_grads()     # required for gradient checkpointing
+    # model.gradient_checkpointing_enable()  # enable gradient checkpointing
 
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer.add_callback(SavePeftModelCallback)
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)

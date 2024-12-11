@@ -345,6 +345,84 @@ def forward_noflashattn(
 
     return attn_output, attn_weights, past_key_value
 
+def forward_dilated_attn(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    padding_mask: Optional[torch.LongTensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
+
+    # Project queries, keys, values
+    query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    # Apply rotary embeddings
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    # Handle past key values
+    if past_key_value is not None:
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+    past_key_value = (key_states, value_states) if use_cache else None
+
+    # Repeat k/v heads if needed
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    # Apply dilated attention
+    heads_per_group = self.num_heads // 4  # Split heads into 4 groups
+    outputs = []
+    
+    for i in range(4):
+        # Different dilation rates for different head groups
+        dilation_rate = 2 ** i
+        
+        # Select current group of heads
+        q_group = query_states[:, i*heads_per_group:(i+1)*heads_per_group]
+        k_group = key_states[:, i*heads_per_group:(i+1)*heads_per_group]
+        v_group = value_states[:, i*heads_per_group:(i+1)*heads_per_group]
+        
+        # Apply dilation by selecting indices
+        if dilation_rate > 1:
+            k_dilated = k_group[:, :, ::dilation_rate]
+            v_dilated = v_group[:, :, ::dilation_rate]
+        else:
+            k_dilated = k_group
+            v_dilated = v_group
+
+        # Compute attention scores
+        attn_weights = torch.matmul(q_group, k_dilated.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # Apply causal mask
+        causal_mask = torch.triu(torch.ones(q_len, k_dilated.size(-2)), diagonal=1).bool()
+        causal_mask = causal_mask.to(attn_weights.device)
+        attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, :k_dilated.size(-2)]
+
+        # Compute attention output
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_output = torch.matmul(attn_weights, v_dilated)
+        outputs.append(attn_output)
+
+    # Combine outputs from different dilation groups
+    attn_output = torch.cat(outputs, dim=1)
+    attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
+    
+    return self.o_proj(attn_output), None, past_key_value
+
 # Disable the transformation of the attention mask in LlamaModel as the flash attention
 # requires the attention mask to be the same as the key_padding_mask
 def _prepare_decoder_attention_mask(
@@ -463,8 +541,10 @@ def _prepare_decoder_attention_mask_inference(
 
     return attention_mask
 
-def replace_llama_attn(use_flash_attn=True, use_full=False, inference=False):
-    if use_flash_attn:
+def replace_llama_attn(use_flash_attn=True, use_full=False, use_dilated=False, inference=False):
+    if use_dilated:
+        transformers.models.llama.modeling_llama.LlamaAttention.forward = forward_dilated_attn
+    elif use_flash_attn:
         cuda_major, cuda_minor = torch.cuda.get_device_capability()
         if cuda_major < 8:
             warnings.warn(
